@@ -1,0 +1,8 @@
+region               = "la-south-2"
+name_prefix          = "mc"
+admin_cidr           = "203.0.113.4/32" # replace with your own IP/32
+ssh_public_key_path  = "~/.ssh/mc-minecraft.pub" # generate with: ssh-keygen -t ed25519 -f ~/.ssh/mc-minecraft -N ""
+alarm_email          = "you@example.com"
+sfs_turbo_size_gb    = 500
+cbr_daily_retention  = 7
+cbr_weekly_retention = 4

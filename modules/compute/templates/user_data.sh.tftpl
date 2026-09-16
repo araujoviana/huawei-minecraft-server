@@ -1,0 +1,101 @@
+#!/bin/bash
+set -euo pipefail
+exec > >(tee -a /var/log/minecraft-bootstrap.log) 2>&1
+
+MINECRAFT_PORT="${minecraft_port}"
+SFS_EXPORT="${sfs_export_location}"
+EIP_ID="${eip_id}"
+REGION="${region}"
+MC_DIR="/opt/minecraft"
+MC_USER="minecraft"
+
+echo "=== Installing packages ==="
+apt-get update -y
+apt-get install -y openjdk-21-jre-headless nfs-common jq curl
+
+echo "=== Creating minecraft user ==="
+id -u "$MC_USER" &>/dev/null || useradd --system --create-home --shell /usr/sbin/nologin "$MC_USER"
+
+echo "=== Mounting SFS Turbo world storage ==="
+mkdir -p "$MC_DIR"
+if ! mountpoint -q "$MC_DIR"; then
+  mount -t nfs -o vers=3,timeo=600,noresvport "$SFS_EXPORT" "$MC_DIR"
+fi
+grep -q "$MC_DIR" /etc/fstab || echo "$SFS_EXPORT $MC_DIR nfs vers=3,timeo=600,noresvport,_netdev 0 0" >> /etc/fstab
+
+echo "=== Fetching latest vanilla Minecraft server ==="
+if [ ! -f "$MC_DIR/server.jar" ]; then
+  MANIFEST_URL="https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
+  MANIFEST=$(curl -s "$MANIFEST_URL")
+  LATEST_RELEASE=$(echo "$MANIFEST" | jq -r '.latest.release')
+  VERSION_URL=$(echo "$MANIFEST" | jq -r --arg v "$LATEST_RELEASE" '.versions[] | select(.id == $v) | .url')
+  SERVER_URL=$(curl -s "$VERSION_URL" | jq -r '.downloads.server.url')
+  curl -s -o "$MC_DIR/server.jar" "$SERVER_URL"
+  echo "eula=true" > "$MC_DIR/eula.txt"
+  if [ ! -f "$MC_DIR/server.properties" ]; then
+    echo "server-port=$MINECRAFT_PORT" > "$MC_DIR/server.properties"
+  fi
+fi
+chown -R "$MC_USER":"$MC_USER" "$MC_DIR"
+
+echo "=== Sizing JVM heap ==="
+TOTAL_MB=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+HEAP_MB=$(( TOTAL_MB * 75 / 100 ))
+
+cat > /etc/systemd/system/minecraft.service <<UNIT
+[Unit]
+Description=Minecraft Java Server
+After=network-online.target remote-fs.target
+Wants=network-online.target
+RequiresMountsFor=$MC_DIR
+
+[Service]
+Type=simple
+User=$MC_USER
+WorkingDirectory=$MC_DIR
+ExecStart=/usr/bin/java -Xms$${HEAP_MB}M -Xmx$${HEAP_MB}M -jar $MC_DIR/server.jar nogui
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now minecraft.service
+
+echo "=== Installing KooCLI ==="
+if ! command -v hcloud &>/dev/null; then
+  curl -s -o /tmp/hcloud.tar.gz "https://ap-southeast-3-hwcloudcli.obs.ap-southeast-3.myhuaweicloud.com/cli/latest/huaweicloud-cli-linux-amd64.tar.gz"
+  tar -zxf /tmp/hcloud.tar.gz -C /tmp
+  find /tmp -maxdepth 2 -type f -name hcloud -exec install -m 0755 {} /usr/local/bin/hcloud \;
+fi
+
+echo "=== Self-associating static EIP ==="
+PROJECT_ID=$(curl -s http://169.254.169.254/openstack/latest/meta_data.json | jq -r '.project_id')
+INSTANCE_ID=$(curl -s http://169.254.169.254/openstack/latest/meta_data.json | jq -r '.uuid')
+
+PORT_ID=$(hcloud VPC ListPorts --cli-region="$REGION" --cli-mode=ecsAgency --device_id="$INSTANCE_ID" 2>/tmp/listports.err | jq -r '.ports[0].id')
+
+if [ -z "$PORT_ID" ] || [ "$PORT_ID" = "null" ]; then
+  echo "WARNING: could not resolve port_id via KooCLI ListPorts; see /tmp/listports.err. EIP self-association skipped — associate it manually."
+else
+  cat > /tmp/associate-eip.json <<JSON
+{
+  "publicip": {
+    "associate_instance_type": "PORT",
+    "associate_instance_id": "$PORT_ID"
+  }
+}
+JSON
+
+  hcloud EIP AssociatePublicips \
+    --cli-region="$REGION" \
+    --cli-mode=ecsAgency \
+    --project_id="$PROJECT_ID" \
+    --publicip_id="$EIP_ID" \
+    --cli-jsonInput=/tmp/associate-eip.json \
+    || echo "WARNING: EIP association call failed — check agency permissions and KooCLI syntax with 'hcloud EIP AssociatePublicips --cli-mode=ecsAgency --help'."
+fi
+
+echo "=== Bootstrap complete ==="
